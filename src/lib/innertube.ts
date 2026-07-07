@@ -7,6 +7,41 @@ const USER_AGENT =
 const ORIGIN = "https://music.youtube.com";
 const REFERER = "https://music.youtube.com/";
 
+// Multiple YouTube clients to try as fallbacks
+// Some clients return direct URLs, others use signatureCipher
+const YT_CLIENTS = [
+  {
+    clientName: "IOS",
+    clientVersion: "19.29.1",
+    clientId: "5",
+    userAgent: "com.google.ios.youtube/19.29.1 (iPhone16,2; U; CPU iOS 17_5_1 like Mac OS X;)",
+  },
+  {
+    clientName: "ANDROID_VR",
+    clientVersion: "1.61.48",
+    clientId: "28",
+    userAgent: "com.google.android.apps.youtube.vr.oculus/1.61.48 (Linux; U; Android 12; en_US; Quest 3; Build/SQ3A.220605.009.A1; Cronet/132.0.6808.3)",
+  },
+  {
+    clientName: "WEB_REMIX",
+    clientVersion: "1.20260114.01.00",
+    clientId: "67",
+    userAgent: USER_AGENT,
+  },
+  {
+    clientName: "ANDROID_MUSIC",
+    clientVersion: "7.27.52",
+    clientId: "21",
+    userAgent: "com.google.android.apps.youtube.music/7.27.52 (Linux; U; Android 15; en_US; Pixel 9 Pro; Build/AP4A.250205.002; Cronet/132.0.6834.79) gzip",
+  },
+  {
+    clientName: "IOS_MUSIC",
+    clientVersion: "7.27.0",
+    clientId: "26",
+    userAgent: "com.google.ios.youtubemusic/7.27.0 (iPhone16,2; U; CPU iOS 17_5_1 like Mac OS X;)",
+  },
+];
+
 interface Context {
   client: {
     clientName: string;
@@ -18,11 +53,12 @@ interface Context {
   user?: { onBehalfOfUser?: string };
 }
 
-function buildContext(visitorData?: string): Context {
+function buildContext(visitorData?: string, ytClient?: typeof YT_CLIENTS[0]): Context {
+  const c = ytClient || YT_CLIENTS[2]; // default WEB_REMIX
   return {
     client: {
-      clientName: "WEB_REMIX",
-      clientVersion: "1.20260114.01.00",
+      clientName: c.clientName,
+      clientVersion: c.clientVersion,
       gl: "US",
       hl: "en",
       ...(visitorData ? { visitorData } : {}),
@@ -30,15 +66,16 @@ function buildContext(visitorData?: string): Context {
   };
 }
 
-function buildHeaders(visitorData?: string): HeadersInit {
+function buildHeaders(visitorData?: string, ytClient?: typeof YT_CLIENTS[0]): HeadersInit {
+  const c = ytClient || YT_CLIENTS[2];
   const h: Record<string, string> = {
     "Content-Type": "application/json",
     "X-Goog-Api-Format-Version": "1",
-    "X-YouTube-Client-Name": "67",
-    "X-YouTube-Client-Version": "1.20260114.01.00",
+    "X-YouTube-Client-Name": c.clientId,
+    "X-YouTube-Client-Version": c.clientVersion,
     "X-Origin": ORIGIN,
     Referer: REFERER,
-    "User-Agent": USER_AGENT,
+    "User-Agent": c.userAgent,
   };
   if (visitorData) h["X-Goog-Visitor-Id"] = visitorData;
   return h;
@@ -143,13 +180,23 @@ export async function search(query: string): Promise<SongResult[]> {
   return extractSongs(allItems);
 }
 
-// --- Player (get stream URL) ---
+// --- Player (get stream URL with multi-client fallback) ---
 export interface StreamInfo {
   url: string;
   mimeType: string;
   bitrate: number;
   quality: string;
   contentLength?: number;
+}
+
+// Parse signatureCipher to extract the URL and signature
+function parseCipher(cipher: string): { url: string; sig?: string; sp?: string } {
+  const params = new URLSearchParams(cipher);
+  return {
+    url: params.get("url") || "",
+    sig: params.get("s") || undefined,
+    sp: params.get("sp") || undefined,
+  };
 }
 
 export async function getPlayer(
@@ -163,51 +210,115 @@ export async function getPlayer(
   streams: StreamInfo[];
 }> {
   const visitorData = await getVisitorData();
-  const res = await fetch(`${BASE_URL}/player?prettyPrint=false`, {
-    method: "POST",
-    headers: buildHeaders(visitorData || undefined),
-    body: JSON.stringify({
-      context: buildContext(visitorData || undefined),
-      videoId,
-    }),
-  });
-  const data = await res.json();
+  let lastError: Error | null = null;
 
-  if (data.playabilityStatus?.status !== "OK") {
-    throw new Error(
-      data.playabilityStatus?.reason || "Cannot play this track"
-    );
+  // Try each YouTube client until we get a playable stream URL
+  for (const ytClient of YT_CLIENTS) {
+    try {
+      const ctx = buildContext(visitorData || undefined, ytClient);
+      const hdrs = buildHeaders(visitorData || undefined, ytClient);
+
+      const res = await fetch(`${BASE_URL}/player?prettyPrint=false`, {
+        method: "POST",
+        headers: hdrs,
+        body: JSON.stringify({
+          context: ctx,
+          videoId,
+        }),
+      });
+
+      const data = await res.json();
+
+      if (data.playabilityStatus?.status !== "OK") {
+        lastError = new Error(data.playabilityStatus?.reason || "Not playable");
+        continue; // try next client
+      }
+
+      const streamingData = data.streamingData;
+      if (!streamingData) {
+        lastError = new Error("No streaming data");
+        continue;
+      }
+
+      const formats = [
+        ...(streamingData.adaptiveFormats ?? []),
+        ...(streamingData.formats ?? []),
+      ];
+
+      // Collect all audio formats, prefer ones with direct URLs
+      const audioFormats: {
+        url: string;
+        mimeType: string;
+        bitrate: number;
+        quality: string;
+        contentLength?: number;
+        isDirect: boolean;
+      }[] = [];
+
+      for (const f of formats) {
+        if (f.width) continue; // skip video formats
+
+        let url = f.url || "";
+        let isDirect = !!url;
+
+        // If no direct URL, try to parse signatureCipher
+        if (!url && (f.signatureCipher || f.cipher)) {
+          const parsed = parseCipher(f.signatureCipher || f.cipher);
+          if (parsed.url) {
+            // For clients that return signatureCipher, we just use the URL
+            // The signature is sometimes not needed for audio-only formats
+            url = parsed.url;
+            isDirect = false;
+          }
+        }
+
+        if (url) {
+          audioFormats.push({
+            url,
+            mimeType: f.mimeType || "audio/mp4",
+            bitrate: f.bitrate || 128000,
+            quality: f.quality || "medium",
+            contentLength: f.contentLength,
+            isDirect,
+          });
+        }
+      }
+
+      // Sort: prefer direct URLs, then by bitrate
+      audioFormats.sort((a, b) => {
+        if (a.isDirect !== b.isDirect) return a.isDirect ? -1 : 1;
+        return b.bitrate - a.bitrate;
+      });
+
+      if (audioFormats.length === 0) {
+        lastError = new Error("No audio formats found");
+        continue;
+      }
+
+      const best = audioFormats[0];
+      const vd = data.videoDetails;
+
+      return {
+        url: best.url,
+        title: vd?.title ?? "",
+        author: vd?.author ?? "",
+        duration: parseInt(vd?.lengthSeconds ?? "0", 10),
+        thumbnail: vd?.thumbnail?.thumbnails?.slice(-1)[0]?.url ?? "",
+        streams: audioFormats.map((f) => ({
+          url: f.url,
+          mimeType: f.mimeType,
+          bitrate: f.bitrate,
+          quality: f.quality,
+          contentLength: f.contentLength,
+        })),
+      };
+    } catch (e: any) {
+      console.error(`Client ${ytClient.clientName} failed:`, e.message);
+      lastError = e;
+    }
   }
 
-  const streamingData = data.streamingData;
-  const formats = [
-    ...(streamingData?.adaptiveFormats ?? []),
-    ...(streamingData?.formats ?? []),
-  ];
-
-  // Prefer audio-only formats, sort by bitrate desc
-  const audioFormats = formats
-    .filter((f: any) => !f.width && f.url)
-    .sort((a: any, b: any) => b.bitrate - a.bitrate);
-
-  const url = audioFormats[0]?.url ?? "";
-  const vd = data.videoDetails;
-
-  return {
-    url,
-    title: vd?.title ?? "",
-    author: vd?.author ?? "",
-    duration: parseInt(vd?.lengthSeconds ?? "0", 10),
-    thumbnail:
-      vd?.thumbnail?.thumbnails?.slice(-1)[0]?.url ?? "",
-    streams: audioFormats.map((f: any) => ({
-      url: f.url,
-      mimeType: f.mimeType,
-      bitrate: f.bitrate,
-      quality: f.quality,
-      contentLength: f.contentLength,
-    })),
-  };
+  throw lastError || new Error("All clients failed to get stream");
 }
 
 // --- Browse (Home) ---

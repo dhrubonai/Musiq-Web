@@ -34,6 +34,43 @@ export async function GET(req: NextRequest) {
       return NextResponse.json(lyrics);
     }
 
+    // Stream proxy - fetch audio from YouTube and pipe to browser
+    if (type === "stream") {
+      const videoId = searchParams.get("videoId");
+      if (!videoId) return NextResponse.json({ error: "Missing videoId" }, { status: 400 });
+
+      const info = await getPlayer(videoId);
+      if (!info.url) return NextResponse.json({ error: "No stream URL" }, { status: 404 });
+
+      const audioRes = await fetch(info.url, {
+        headers: {
+          "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+          Range: req.headers.get("range") || "",
+        },
+      });
+
+      if (!audioRes.ok && audioRes.status !== 206) {
+        return NextResponse.json({ error: "Stream fetch failed" }, { status: 502 });
+      }
+
+      const contentType = audioRes.headers.get("content-type") || "audio/mp4";
+      const contentLength = audioRes.headers.get("content-length");
+      const contentRange = audioRes.headers.get("content-range");
+      const acceptRanges = audioRes.headers.get("accept-ranges");
+
+      const headers = new Headers();
+      headers.set("Content-Type", contentType);
+      if (contentLength) headers.set("Content-Length", contentLength);
+      if (contentRange) headers.set("Content-Range", contentRange);
+      if (acceptRanges) headers.set("Accept-Ranges", acceptRanges);
+      headers.set("Cache-Control", "public, max-age=3600");
+
+      return new NextResponse(audioRes.body, {
+        status: audioRes.status,
+        headers,
+      });
+    }
+
     return NextResponse.json({ error: "Unknown type" }, { status: 400 });
   } catch (e: any) {
     console.error("Music API error:", e);

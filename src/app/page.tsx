@@ -219,29 +219,26 @@ export default function MusiqWeb() {
     }
 
     try {
-      const res = await fetch(`/api/music?type=player&videoId=${song.videoId}`)
-      if (!res.ok) throw new Error('Failed to get stream')
-      const data = await res.json()
-      if (data.error) throw new Error(data.error)
-      if (data.url) {
-        setStreamUrl(data.url)
-        setTimeout(() => {
-          audioRef.current?.play()
+      // Use stream proxy - audio is piped through our server
+      // This avoids IP-binding and CORS issues with YouTube stream URLs
+      setStreamUrl(`/api/music?type=stream&videoId=${song.videoId}`)
+      setTimeout(() => {
+        audioRef.current?.play().then(() => {
           setIsPlaying(true)
-        }, 100)
-      } else {
-        throw new Error('No stream URL available')
-      }
-      // Fetch lyrics
+        }).catch((err) => {
+          console.error('Playback failed:', err)
+          setError('Playback failed. Try another track.')
+        })
+      }, 200)
+      // Fetch lyrics in background (don't block playback)
       setLyricsLoading(true)
-      try {
-        const lRes = await fetch(
-          `/api/music?type=lyrics&title=${encodeURIComponent(song.title)}&artist=${encodeURIComponent(song.artists)}&duration=${data.duration || ''}`
-        )
-        const lData = await lRes.json()
-        if (Array.isArray(lData) && lData.length > 0) setLyrics(lData)
-      } catch { /* lyrics unavailable */ }
-      setLyricsLoading(false)
+      fetch(
+        `/api/music?type=lyrics&title=${encodeURIComponent(song.title)}&artist=${encodeURIComponent(song.artists)}`
+      )
+        .then(res => res.json())
+        .then(lData => { if (Array.isArray(lData) && lData.length > 0) setLyrics(lData) })
+        .catch(() => {})
+        .finally(() => setLyricsLoading(false))
     } catch (e: any) {
       console.error('Play error:', e)
       setError(e.message || 'Failed to play this track')
