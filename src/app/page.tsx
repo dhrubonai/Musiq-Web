@@ -219,9 +219,15 @@ export default function MusiqWeb() {
     }
 
     try {
-      // Use stream proxy - audio is piped through our server
-      // This avoids IP-binding and CORS issues with YouTube stream URLs
-      setStreamUrl(`/api/music?type=stream&videoId=${song.videoId}`)
+      // Get stream URL from API (tries multiple YouTube clients as fallback)
+      const res = await fetch(`/api/music?type=player&videoId=${song.videoId}`)
+      if (!res.ok) throw new Error('Failed to get stream')
+      const data = await res.json()
+      if (data.error) throw new Error(data.error)
+      if (!data.url) throw new Error('No stream URL available')
+
+      // Set audio src directly — HTML <audio> plays cross-origin without CORS
+      setStreamUrl(data.url)
       setTimeout(() => {
         audioRef.current?.play().then(() => {
           setIsPlaying(true)
